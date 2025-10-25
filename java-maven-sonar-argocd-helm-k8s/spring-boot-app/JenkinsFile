@@ -1,68 +1,129 @@
 pipeline {
   agent {
     docker {
-      image 'sagar1602/maven-sagar-docker-agent:v1'
-      args '--user root -v /var/run/docker.sock:/var/run/docker.sock' // mount Docker socket to access the host's Docker daemon
+      image 'sagar1602/maven-sagar-docker-agent:v1'     // must contain: mvn, git, docker CLI, curl
+      args  '--user root -v /var/run/docker.sock:/var/run/docker.sock'
     }
   }
+
+  options {
+    timestamps()
+    ansiColor('xterm')
+  }
+
+  environment {
+    // --- URLs & paths ---
+    SONAR_URL     = 'http://16.171.24.196:9000'
+    GIT_USER_NAME = 'iam-veeramalla'
+    GIT_REPO_NAME = 'Jenkins-Zero-To-Hero'
+    APP_DIR       = 'java-maven-sonar-argocd-helm-k8s/spring-boot-app'
+    MANIFEST_FILE = 'java-maven-sonar-argocd-helm-k8s/spring-boot-app-manifests/deployment.yml'
+
+    // --- Docker image to build/push ---
+    DOCKER_IMAGE  = "sagar1602/ultimate-cicd:${BUILD_NUMBER}"
+  }
+
   stages {
+
     stage('Checkout') {
       steps {
-        sh 'echo passed'
-        //git branch: 'main', url: 'https://github.com/iam-veeramalla/Jenkins-Zero-To-Hero.git'
+        script {
+          // Works for both job types: prefer SCM config; else fall back to explicit git clone
+          try {
+            checkout scm
+          } catch (ignored) {
+            git branch: 'main', url: "https://github.com/${GIT_USER_NAME}/${GIT_REPO_NAME}.git"
+          }
+        }
+        sh '''
+          echo "Repo status:"
+          pwd
+          git rev-parse --short HEAD || true
+          ls -la
+        '''
       }
     }
-    stage('Build and Test') {
+
+    stage('Sanity') {
       steps {
-        sh 'ls -ltr'
-        // build the project and create a JAR file
-        sh 'cd java-maven-sonar-argocd-helm-k8s/spring-boot-app && mvn clean package'
+        sh '''
+          echo "Checking required paths..."
+          test -d "${APP_DIR}"        || { echo "Missing ${APP_DIR}"; exit 1; }
+          test -f "${MANIFEST_FILE}"  || { echo "Missing ${MANIFEST_FILE}"; exit 1; }
+          echo "Checking Sonar reachability (from build container):"
+          curl -sI ${SONAR_URL} || true
+          echo "Docker daemon info:"
+          docker version || true
+        '''
       }
     }
-    stage('Static Code Analysis') {
-      environment {
-        SONAR_URL = "http://16.171.24.196:9000"
-      }
+
+    stage('Build & Test (Maven)') {
       steps {
-        withCredentials([string(credentialsId: 'SonarQube', variable: 'SONAR_AUTH_TOKEN')]) {
-          sh 'cd java-maven-sonar-argocd-helm-k8s/spring-boot-app && mvn sonar:sonar -Dsonar.login=$SONAR_AUTH_TOKEN -Dsonar.host.url=${SONAR_URL}'
+        sh """
+          cd ${APP_DIR}
+          mvn -v
+          mvn -B clean package
+        """
+      }
+    }
+
+    stage('Static Code Analysis (SonarQube)') {
+      steps {
+        // IMPORTANT: credentialsId must match your Jenkins credential ID (case-sensitive).
+        // Create a Secret Text credential in Jenkins: ID = 'sonarqube', value = your Sonar token.
+        withCredentials([string(credentialsId: 'sonarqube', variable: 'SONAR_AUTH_TOKEN')]) {
+          sh """
+            cd ${APP_DIR}
+            mvn -B sonar:sonar \
+              -Dsonar.host.url=${SONAR_URL} \
+              -Dsonar.login=$SONAR_AUTH_TOKEN
+          """
         }
       }
     }
-    stage('Build and Push Docker Image') {
-      environment {
-        DOCKER_IMAGE = "sagar1602/ultimate-cicd:${BUILD_NUMBER}"
-        // DOCKERFILE_LOCATION = "java-maven-sonar-argocd-helm-k8s/spring-boot-app/Dockerfile"
-        REGISTRY_CREDENTIALS = credentials('docker-cred')
-      }
+
+    stage('Build & Push Docker Image') {
       steps {
         script {
-            sh 'cd java-maven-sonar-argocd-helm-k8s/spring-boot-app && docker build -t ${DOCKER_IMAGE} .'
-            def dockerImage = docker.image("${DOCKER_IMAGE}")
-            docker.withRegistry('https://index.docker.io/v1/', "docker-cred") {
-                dockerImage.push()
-            }
+          sh """
+            cd ${APP_DIR}
+            docker build -t ${DOCKER_IMAGE} .
+          """
+          def img = docker.image("${DOCKER_IMAGE}")
+          // Jenkins credential: Username/Password with ID = 'docker-cred'
+          docker.withRegistry('https://index.docker.io/v1/', 'docker-cred') {
+            img.push()
+          }
         }
       }
     }
-    stage('Update Deployment File') {
-        environment {
-            GIT_REPO_NAME = "Jenkins-Zero-To-Hero"
-            GIT_USER_NAME = "iam-veeramalla"
+
+    stage('Update Manifests & Push to GitHub') {
+      steps {
+        // Jenkins credential: Secret Text with ID = 'github' (PAT with 'repo' scope & push rights)
+        withCredentials([string(credentialsId: 'github', variable: 'GITHUB_TOKEN')]) {
+          sh """
+            git config user.email "sagarchoudhary1602@gmail.com"
+            git config user.name  "sagar1602"
+
+            sed -i "s/replaceImageTag/${BUILD_NUMBER}/g" ${MANIFEST_FILE}
+            git add ${MANIFEST_FILE}
+            git commit -m "Update deployment image to version ${BUILD_NUMBER}" || echo "No changes to commit"
+
+            git push https://${GITHUB_TOKEN}@github.com/${GIT_USER_NAME}/${GIT_REPO_NAME}.git HEAD:main
+          """
         }
-        steps {
-            withCredentials([string(credentialsId: 'github', variable: 'GITHUB_TOKEN')]) {
-                sh '''
-                    git config user.email "sagarchoudhary1602@gmail.com"
-                    git config user.name "sagar1602"
-                    BUILD_NUMBER=${BUILD_NUMBER}
-                    sed -i "s/replaceImageTag/${BUILD_NUMBER}/g" java-maven-sonar-argocd-helm-k8s/spring-boot-app-manifests/deployment.yml
-                    git add java-maven-sonar-argocd-helm-k8s/spring-boot-app-manifests/deployment.yml
-                    git commit -m "Update deployment image to version ${BUILD_NUMBER}"
-                    git push https://${GITHUB_TOKEN}@github.com/${GIT_USER_NAME}/${GIT_REPO_NAME} HEAD:main
-                '''
-            }
-        }
+      }
+    }
+  }
+
+  post {
+    failure {
+      echo 'Pipeline failed — check the stage logs above for the exact error.'
+    }
+    success {
+      echo "✅ Build ${BUILD_NUMBER} complete. Image pushed: ${DOCKER_IMAGE}"
     }
   }
 }
